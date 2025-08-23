@@ -6,3 +6,4 @@ pandas
 numpy
 scikit-learn
 passlib
+openai>=1.40.0
