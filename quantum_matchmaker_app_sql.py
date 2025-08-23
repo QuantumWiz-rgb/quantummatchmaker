@@ -1,9 +1,9 @@
 # quantum_matchmaker_app_sql.py
 # Streamlit app with SQLAlchemy backend + accounts + per-user privacy.
-# - End-user needs are PRIVATE to the owner (only they see & match on them)
-# - Suppliers create PUBLIC company profiles (discoverable by end-users)
-# - End-users can optionally mark a need as "share with suppliers" (public lead)
-# - Admin-only directory (emails in ADMIN_EMAILS)
+# Chain of command (per-application):
+# - End-user sees SENSOR matches only (private needs/cases)
+# - Sensor sees END-USER leads (opt-in) + MATERIALS matches (scoped by selected Opportunity)
+# - Materials sees SENSOR matches only (no end-user visibility)
 
 import os, re
 from datetime import datetime, timezone
@@ -29,14 +29,14 @@ ADMIN_EMAILS = set(
 # ---------- Ontology (trimmed) ----------
 TECH_ONTOLOGY: Dict[str, List[str]] = {
     "magnetometry": ["magnetometer","magnetometry","magnetic","heading","compass","geomagnetic","magnetic anomaly","magnetic navigation","vector field","scalar field"],
-    "NV_diamond": ["nv center","nitrogen vacancy","nv-diamond","diamond magnetometer","odmr","optically detected magnetic resonance","green laser 532 nm","red fluorescence","spin contrast"],
-    "SERF_OPM": ["serf","spin-exchange relaxation-free","opm","optically pumped magnetometer","alkali vapor","rubidium","rb87","cesium","cs","k39","potassium","quartz cell","anti-relaxation coating"],
-    "SQUID": ["squid","superconducting quantum interference device","superconducting","cryogenic","ybco","niobium","cryocooler"],
+    "NV_diamond": ["nv center","nitrogen vacancy","nv-diamond","diamond magnetometer","odmr","optically detected magnetic resonance","green laser 532 nm","red fluorescence","spin contrast","ltm","laser threshold","diamond","cvd"],
+    "SERF_OPM": ["serf","spin-exchange relaxation-free","opm","optically pumped magnetometer","alkali vapor","rubidium","rb87","cesium","cs","k39","potassium","quartz cell","anti-relaxation coating","paraffin"],
+    "SQUID": ["squid","superconducting quantum interference device","superconducting","cryogenic","ybco","niobium","cryocooler","thin film"],
     "gyroscope": ["gyroscope","imu","inertial","rotation","angular rate","heading drift"],
     "gravimetry": ["gravimeter","gravity","gradiometer","mass anomaly","subsurface mapping"],
     "agriculture": ["agriculture","farming","tractor","combine","planter","irrigation","soil","row crop","pasture","underground pipe","tile drain","subsurface","field"],
     "harsh_env": ["dust","mud","vibration","shock","temperature","humidity","ip67","ip68","rugged"],
-    "gps_denied": ["gps-free","gps denied","no gps","under canopy","indoors","tunnel"],
+    "gps_denied": ["gps-free","gps denied","no gps","under canopy","indoors","tunnel","aircraft","airplane","cockpit"],
     "power": ["battery","low power","milliwatt","watt","power budget","solar"],
     "cost": ["cost","unit cost","bom","price","affordable","low-cost"],
     "safety": ["laser safety","eye safe","non-ionizing","intrinsic safety","emc","emissions"],
@@ -116,13 +116,13 @@ def environment_bonus(env: str, supplier_text: str) -> float:
     e = normalize_text(env or "")
     s = normalize_text(supplier_text or "")
     bonus = 0.0
-    if any(t in e for t in ["outdoor","underground","field","tractor","vibration","shock","mud","dust","ip67","ip68","harsh"]):
+    if any(t in e for t in ["outdoor","underground","field","tractor","vibration","shock","mud","dust","ip67","ip68","harsh","aircraft","airplane"]):
         if any(w in s for w in ["rugged","ip67","ip68","vibration","shock","temperature","dust","mud"]):
             bonus += 0.15
     if any(t in e for t in ["underground","subsurface","pipe","tile drain"]):
         if any(w in s for w in ["magnet","magnetometer","magnetometry","gravimeter","gradiometer"]):
             bonus += 0.1
-    if any(t in e for t in ["gps denied","gps-free","no gps","under canopy","indoors","tunnel"]):
+    if any(t in e for t in ["gps denied","gps-free","no gps","under canopy","indoors","tunnel","aircraft","airplane"]):
         if "magnet" in s or "inertial" in s or "compass" in s:
             bonus += 0.1
     return bonus
@@ -189,6 +189,19 @@ def init_db():
                 created_at TEXT
             )
         """))
+        # NEW: opportunities table (per-application containers owned by sensors)
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS opportunities (
+                id INTEGER PRIMARY KEY {_auto_inc_kw()},
+                owner_id INTEGER,              -- user id (sensor's account)
+                sensor_company_id INTEGER,     -- companies.id (role='sensor')
+                need_id INTEGER NULL,          -- needs.id (nullable)
+                title TEXT,
+                technique TEXT,                -- free text for now (e.g., NV-ODMR, NV-LTM, SERF OPM)
+                status TEXT,                   -- open/closed
+                created_at TEXT
+            )
+        """))
         # Migrate existing DBs (add columns if missing)
         def ensure_col(table, name, sqldef):
             try:
@@ -199,6 +212,11 @@ def init_db():
         ensure_col("companies", "owner_id", "owner_id INTEGER")
         ensure_col("needs", "share_with_suppliers", "share_with_suppliers TINYINT")
         ensure_col("needs", "owner_id", "owner_id INTEGER")
+        # ensure cols for opportunities if schema pre-existed without some columns
+        try:
+            conn.execute(text("SELECT owner_id, sensor_company_id, need_id, technique, status FROM opportunities LIMIT 1"))
+        except Exception:
+            pass
 
 def create_user(email: str, org: str, role: str, password: str) -> Optional[int]:
     eng = get_engine()
@@ -267,6 +285,24 @@ def insert_need(row: dict, owner_id: Optional[int]):
             "ts": datetime.now(timezone.utc).isoformat()
         })
 
+def insert_opportunity(owner_id: int, sensor_company_id: int, need_id: Optional[int], title: str, technique: str) -> int:
+    eng = get_engine()
+    with eng.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO opportunities (owner_id, sensor_company_id, need_id, title, technique, status, created_at)
+            VALUES (:owner_id,:sensor_company_id,:need_id,:title,:technique,:status,:ts)
+        """), {
+            "owner_id": owner_id,
+            "sensor_company_id": sensor_company_id,
+            "need_id": need_id,
+            "title": title or "New Opportunity",
+            "technique": technique or "",
+            "status": "open",
+            "ts": datetime.now(timezone.utc).isoformat()
+        })
+        oid = conn.execute(text("SELECT last_insert_rowid()")) if DATABASE_URL.startswith("sqlite") else conn.execute(text("SELECT LAST_INSERT_ID()"))
+        return int(list(oid)[0][0])
+
 def fetch_df(table: str, where: Optional[str] = None, params: Optional[dict] = None) -> pd.DataFrame:
     eng = get_engine()
     with eng.begin() as conn:
@@ -274,6 +310,14 @@ def fetch_df(table: str, where: Optional[str] = None, params: Optional[dict] = N
         if where: q += f" WHERE {where}"
         df = pd.read_sql(text(q), conn, params=params)
     return df
+
+def fetch_opportunities(owner_id: int, sensor_company_id: Optional[int] = None) -> pd.DataFrame:
+    where = "owner_id=:oid"
+    params = {"oid": owner_id}
+    if sensor_company_id:
+        where += " AND sensor_company_id=:sid"
+        params["sid"] = sensor_company_id
+    return fetch_df("opportunities", where=where, params=params)
 
 def delete_row(table: str, row_id: int, owner_id: Optional[int] = None, admin: bool = False) -> bool:
     eng = get_engine()
@@ -303,7 +347,6 @@ def add_docs_tags_needs(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _safe_sort(df: pd.DataFrame, by, ascending):
-    """Sort only by columns that actually exist."""
     if df.empty:
         return df
     by = [c for c in by if c in df.columns]
@@ -337,14 +380,13 @@ def compute_need_to_sensor_scores(needs_df: pd.DataFrame, sensors_df: pd.DataFra
     for i, nrow in needs_df.iterrows():
         for j, srow in sensors_df.iterrows():
             cos_score = float(cos[needs_df.index.get_loc(i), sensors_df.index.get_loc(j)])
-            need_tags = nrow["_tech_tags"]
-            sensor_tags = srow["_tech_tags"]
+            need_tags = nrow["_tech_tags"]; sensor_tags = srow["_tech_tags"]
             tech_overlap = len(set(need_tags).intersection(set(sensor_tags)))
             domain_bonus = 0.05 * tech_overlap + environment_bonus(nrow.get("environment",""), srow.get("capabilities_text",""))
             if "gps_denied" in nrow["_doc"] or "gps free" in normalize_text(nrow.get("need_text","")):
                 if any(t in srow["_doc"] for t in ["magnet","imu","compass","magnetometer","magnetometry"]):
                     domain_bonus += 0.08
-            trl = srow["trl"] if pd.notna(srow.get("trl")) else None
+            trl = srow.get("trl") if pd.notna(srow.get("trl")) else None
             trl_score = trl_alignment_score(nrow.get("timeline",""), trl)
             pen = constraint_penalties(nrow.get("constraints",""), srow.get("capabilities_text",""))
             total = alpha * cos_score + beta * domain_bonus + gamma * trl_score + pen
@@ -359,6 +401,91 @@ def compute_need_to_sensor_scores(needs_df: pd.DataFrame, sensors_df: pd.DataFra
             })
     df = pd.DataFrame(rows, columns=cols)
     return _safe_sort(df, ["need_org","need_title","total_score"], [True, True, False])
+
+def compute_sensor_to_material_scores(sensor_df: pd.DataFrame, materials_df: pd.DataFrame,
+                                      need_context: Optional[pd.Series] = None,
+                                      alpha=0.65, beta=0.25, gamma=0.10) -> pd.DataFrame:
+    """Match ONE sensor profile (rows=1) to many materials; optionally use a need context for env/constraints bonuses."""
+    cols = [
+        "sensor_id","sensor_company","materials_company","materials_id",
+        "cosine","domain_bonus","context_bonus","total_score",
+        "sensor_tags","materials_tags","materials_focus","materials_contact"
+    ]
+    if sensor_df is None or sensor_df.empty or materials_df is None or materials_df.empty:
+        return pd.DataFrame(columns=cols)
+    sdocs = sensor_df["_doc"].tolist()
+    mdocs = materials_df["_doc"].tolist()
+    try:
+        vec = build_vectorizer(sdocs + mdocs)
+        S = vec.transform(sdocs)
+        M = vec.transform(mdocs)
+        cos = cosine_similarity(S, M)[0]  # single sensor row expected
+    except Exception:
+        cos = np.zeros(len(mdocs))
+
+    env = need_context.get("environment","") if need_context is not None else ""
+    constraints = need_context.get("constraints","") if need_context is not None else ""
+    sensor_row = sensor_df.iloc[0]
+    s_tags = set(sensor_row["_tech_tags"])
+
+    rows = []
+    for j, mrow in materials_df.iterrows():
+        m_tags = set(mrow["_tech_tags"])
+        tech_overlap = len(s_tags.intersection(m_tags))
+        dom_bonus = 0.06 * tech_overlap
+        ctx_bonus = 0.0
+        if need_context is not None:
+            ctx_bonus += environment_bonus(env, mrow.get("capabilities_text",""))
+            # light penalty propagation on materials if constraints overtly conflict
+            ctx_bonus += constraint_penalties(constraints, mrow.get("capabilities_text",""))  # negative values reduce
+        total = alpha * float(cos[j]) + beta * dom_bonus + gamma * ctx_bonus
+        rows.append({
+            "sensor_id": sensor_row["id"], "sensor_company": sensor_row["company_name"],
+            "materials_company": mrow["company_name"], "materials_id": mrow["id"],
+            "cosine": round(float(cos[j]), 4), "domain_bonus": round(dom_bonus, 4),
+            "context_bonus": round(ctx_bonus, 4), "total_score": round(total, 4),
+            "sensor_tags": ";".join(sorted(s_tags)), "materials_tags": ";".join(sorted(m_tags)),
+            "materials_focus": mrow.get("focus_areas",""), "materials_contact": mrow.get("contact",""),
+        })
+    df = pd.DataFrame(rows, columns=cols)
+    return _safe_sort(df, ["total_score"], [False])
+
+def compute_material_to_sensor_scores(material_df: pd.DataFrame, sensors_df: pd.DataFrame,
+                                      alpha=0.65, beta=0.25, gamma=0.10) -> pd.DataFrame:
+    """Mirror of sensor->materials for the materials user (no end-user context)."""
+    cols = [
+        "materials_id","materials_company","sensor_company","sensor_id",
+        "cosine","domain_bonus","total_score","materials_tags","sensor_tags",
+        "sensor_focus","sensor_contact"
+    ]
+    if material_df is None or material_df.empty or sensors_df is None or sensors_df.empty:
+        return pd.DataFrame(columns=cols)
+    mdocs = material_df["_doc"].tolist()
+    sdocs = sensors_df["_doc"].tolist()
+    try:
+        vec = build_vectorizer(mdocs + sdocs)
+        M = vec.transform(mdocs)
+        S = vec.transform(sdocs)
+        cos = cosine_similarity(M, S)[0]
+    except Exception:
+        cos = np.zeros(len(sdocs))
+
+    m_tags = set(material_df.iloc[0]["_tech_tags"])
+    rows = []
+    for j, srow in sensors_df.iterrows():
+        s_tags = set(srow["_tech_tags"])
+        dom_bonus = 0.06 * len(m_tags.intersection(s_tags))
+        total = alpha * float(cos[j]) + beta * dom_bonus + gamma * 0.0
+        rows.append({
+            "materials_id": material_df.iloc[0]["id"], "materials_company": material_df.iloc[0]["company_name"],
+            "sensor_company": srow["company_name"], "sensor_id": srow["id"],
+            "cosine": round(float(cos[j]), 4), "domain_bonus": round(dom_bonus, 4),
+            "total_score": round(total, 4),
+            "materials_tags": ";".join(sorted(m_tags)), "sensor_tags": ";".join(sorted(s_tags)),
+            "sensor_focus": srow.get("focus_areas",""), "sensor_contact": srow.get("contact",""),
+        })
+    df = pd.DataFrame(rows, columns=cols)
+    return _safe_sort(df, ["total_score"], [False])
 
 # ---------- UI ----------
 st.set_page_config(page_title="Quantum Matchmaker (Auth)", page_icon="🧭", layout="wide")
@@ -464,64 +591,124 @@ elif nav == "Find Matches":
     user = st.session_state["user"]
     st.header("Find Matches")
 
-    companies = fetch_df("companies", where="public_profile=1", params={})
-    needs_all = fetch_df("needs", where="owner_id=:oid", params={"oid": user["id"]})
+    # Shared prep
+    companies_public = fetch_df("companies", where="public_profile=1", params={})
+    needs_owned = fetch_df("needs", where="owner_id=:oid", params={"oid": user["id"]})
+    companies_public = add_docs_tags_companies(companies_public)
+    needs_owned = add_docs_tags_needs(needs_owned)
 
-    companies = add_docs_tags_companies(companies)
-    needs_all = add_docs_tags_needs(needs_all)
+    mode = st.selectbox("I am looking for matches for my…", ["End-User Need", "Sensor Company", "Materials Supplier"])
+    topk = st.slider("Top-K results", 1, 20, 7)
 
-    mode = st.selectbox("I want matches for my…", ["End-User Need", "Sensor Company", "Materials Supplier"])
-    topk = st.slider("Top-K results", 1, 15, 7)
-
+    # ---- End-User: see sensors only
     if mode == "End-User Need":
-        if needs_all.empty:
+        if needs_owned.empty:
             st.info("You have no saved needs yet. Add one in Submit.")
         else:
-            pick = st.selectbox("Select need", [f"#{r.id} • {r.org_name} — {r.need_title}" for _, r in needs_all.iterrows()])
+            pick = st.selectbox("Select need", [f"#{r.id} • {r.org_name} — {r.need_title}" for _, r in needs_owned.iterrows()])
             pick_id = int(pick.split("•")[0].strip()[1:])
-            need_sel = needs_all[needs_all["id"] == pick_id]
-            sensors = companies[companies["role"] == "sensor"]
+            need_sel = needs_owned[needs_owned["id"] == pick_id]
+            sensors = companies_public[companies_public["role"] == "sensor"]
             matches = compute_need_to_sensor_scores(need_sel, sensors)
             if matches.empty:
                 st.info("No matching sensors yet. Add supplier profiles, or broaden your need description.")
             else:
-                matches = matches.head(topk)
+                st.subheader("Best Sensor Matches")
                 show_cols = [c for c in [
                     "sensor_company","total_score","cosine","domain_bonus","trl_score","penalty",
                     "sensor_focus","sensor_trl","sensor_contact"
                 ] if c in matches.columns]
-                st.subheader("Best Sensor Matches")
-                st.dataframe(matches[show_cols], use_container_width=True)
+                st.dataframe(matches.head(topk)[show_cols], use_container_width=True)
 
+    # ---- Sensor: see end-user leads + materials (scoped by chosen Opportunity)
     elif mode == "Sensor Company":
         my_sensors = fetch_df("companies", where="owner_id=:oid AND role='sensor'", params={"oid": user["id"]})
         my_sensors = add_docs_tags_companies(my_sensors)
         if my_sensors.empty:
             st.info("You have no sensor profiles yet. Save one in Submit.")
         else:
-            pick = st.selectbox("Select your sensor profile", [f"#{r.id} • {r.company_name}" for _, r in my_sensors.iterrows()])
-            sid = int(pick.split("•")[0].strip()[1:])
+            pick_sensor = st.selectbox("Select your sensor profile", [f"#{r.id} • {r.company_name}" for _, r in my_sensors.iterrows()])
+            sid = int(pick_sensor.split("•")[0].strip()[1:])
             s_sel = my_sensors[my_sensors["id"] == sid]
-            public_needs = fetch_df("needs", where="share_with_suppliers=1", params={})
-            public_needs = add_docs_tags_needs(public_needs)
-            matches = compute_need_to_sensor_scores(public_needs, s_sel)
-            if matches.empty:
-                st.info("No public leads yet. End-users must opt-in by checking 'share with suppliers' on a need.")
-            else:
-                matches = matches.head(topk)
-                show_cols = [c for c in [
-                    "need_org","need_title","total_score","cosine","domain_bonus","trl_score","penalty"
-                ] if c in matches.columns]
-                st.subheader("Public Leads (end-users who opted to share)")
-                st.dataframe(matches[show_cols], use_container_width=True)
 
-    else:  # Materials Supplier
+            tabs = st.tabs(["End-User Leads", "Materials Matches"])
+
+            # --- End-User Leads (opt-in)
+            with tabs[0]:
+                public_needs = fetch_df("needs", where="share_with_suppliers=1", params={})
+                public_needs = add_docs_tags_needs(public_needs)
+                lead_matches = compute_need_to_sensor_scores(public_needs, s_sel)
+                if lead_matches.empty:
+                    st.info("No public end-user leads yet. End-users must opt-in by checking 'share with suppliers'.")
+                else:
+                    st.subheader("Matching End-User Leads")
+                    show_cols = [c for c in [
+                        "need_org","need_title","total_score","cosine","domain_bonus","trl_score","penalty"
+                    ] if c in lead_matches.columns]
+                    st.dataframe(lead_matches.head(topk)[show_cols], use_container_width=True)
+
+                    # Create an Opportunity from a selected lead
+                    pick_lead = st.selectbox(
+                        "Create an Opportunity for this lead",
+                        [f"#{r.need_id} • {r.need_org} — {r.need_title}" for _, r in lead_matches.iterrows()]
+                    )
+                    if pick_lead:
+                        lead_id = int(pick_lead.split("•")[0].strip()[1:])
+                        with st.form("form_create_opp"):
+                            opp_title = st.text_input("Opportunity title", value=f"{s_sel.iloc[0]['company_name']} × Lead #{lead_id}")
+                            technique = st.text_input("Technique (e.g., NV-ODMR, NV-LTM, SERF OPM)")
+                            create = st.form_submit_button("Start Opportunity")
+                        if create:
+                            oid = insert_opportunity(owner_id=user["id"], sensor_company_id=sid, need_id=lead_id,
+                                                     title=opp_title, technique=technique)
+                            st.success(f"Opportunity #{oid} created.")
+
+            # --- Materials Matches (scoped by Opportunity if chosen)
+            with tabs[1]:
+                st.caption("Tip: choose an Opportunity to include that lead's environment/constraints in the ranking.")
+                my_opps = fetch_opportunities(owner_id=user["id"], sensor_company_id=sid)
+                opp_label_list = ["Ad-hoc (no lead context)"] + [f"#{r.id} • {r.title or 'Untitled'}" for _, r in my_opps.iterrows()]
+                pick_opp = st.selectbox("Use Opportunity context", opp_label_list)
+                need_ctx = None
+                if pick_opp != "Ad-hoc (no lead context)":
+                    opp_id = int(pick_opp.split("•")[0].strip()[1:])
+                    opp_row = my_opps[my_opps["id"] == opp_id].iloc[0]
+                    if pd.notna(opp_row.get("need_id")) and int(opp_row["need_id"]) > 0:
+                        need_ctx_df = fetch_df("needs", where="id=:nid", params={"nid": int(opp_row["need_id"])})
+                        need_ctx = need_ctx_df.iloc[0] if not need_ctx_df.empty else None
+
+                materials = companies_public[companies_public["role"] == "materials"]
+                s2m = compute_sensor_to_material_scores(s_sel, materials, need_context=need_ctx)
+                if s2m.empty:
+                    st.info("No matching materials yet. Encourage materials suppliers to add public profiles, or broaden your technique/capability text.")
+                else:
+                    st.subheader("Best Materials Matches")
+                    show_cols = [c for c in [
+                        "materials_company","total_score","cosine","domain_bonus","context_bonus",
+                        "materials_focus","materials_contact","materials_tags"
+                    ] if c in s2m.columns]
+                    st.dataframe(s2m.head(topk)[show_cols], use_container_width=True)
+
+    # ---- Materials: see sensors only (no end-user visibility)
+    else:
         my_mats = fetch_df("companies", where="owner_id=:oid AND role='materials'", params={"oid": user["id"]})
         my_mats = add_docs_tags_companies(my_mats)
         if my_mats.empty:
             st.info("You have no materials profiles yet. Save one in Submit.")
         else:
-            st.info("Materials matching (sensor → materials) can be added next; current release focuses on privacy and end-user ↔ sensor matching.")
+            pick_mat = st.selectbox("Select your materials profile", [f"#{r.id} • {r.company_name}" for _, r in my_mats.iterrows()])
+            mid = int(pick_mat.split("•")[0].strip()[1:])
+            m_sel = my_mats[my_mats["id"] == mid]
+            sensors_pub = companies_public[companies_public["role"] == "sensor"]
+            m2s = compute_material_to_sensor_scores(m_sel, sensors_pub)
+            if m2s.empty:
+                st.info("No matching sensors yet. Encourage sensors to publish profiles, or broaden your capability text.")
+            else:
+                st.subheader("Best Sensor Matches")
+                show_cols = [c for c in [
+                    "sensor_company","total_score","cosine","domain_bonus","sensor_focus","sensor_contact","sensor_tags"
+                ] if c in m2s.columns]
+                st.dataframe(m2s.head(topk)[show_cols], use_container_width=True)
 
 # ----- Directory & Admin -----
 elif nav == "Directory & Admin":
@@ -532,7 +719,7 @@ elif nav == "Directory & Admin":
         st.stop()
 
     st.header("Directory & Admin")
-    tabs = st.tabs(["Companies", "Needs", "Users"])
+    tabs = st.tabs(["Companies", "Needs", "Opportunities", "Users"])
 
     with tabs[0]:
         df = fetch_df("companies")
@@ -551,6 +738,14 @@ elif nav == "Directory & Admin":
             st.success("Deleted." if ok else "Not found.")
 
     with tabs[2]:
+        df = fetch_df("opportunities")
+        st.dataframe(df)
+        del_id = st.number_input("Delete opportunity by ID", min_value=0, step=1, value=0, key="del_opp")
+        if st.button("Delete Opportunity"):
+            ok = delete_row("opportunities", int(del_id), owner_id=user["id"], admin=True)
+            st.success("Deleted." if ok else "Not found.")
+
+    with tabs[3]:
         df = fetch_df("users")
         st.dataframe(df[["id","email","org_name","account_role","created_at"]])
 
@@ -558,9 +753,8 @@ elif nav == "Directory & Admin":
 else:
     st.header("About")
     st.write("""
-This build adds **accounts and privacy**:
-- End-user needs are **private** to the owner.
-- Suppliers create **public** profiles.
-- End-users can optionally **share** a specific need as a public lead.
-- Only **admins** (emails in `ADMIN_EMAILS`) can view directory tables.
+This build implements **chain of command** with **per-application Opportunities**:
+- End-users match to **sensors** (private).
+- Sensors match to **end-user leads** (opt-in) **and** to **materials** within a selected Opportunity.
+- Materials match to **sensors** only (no end-user visibility).
 """)
