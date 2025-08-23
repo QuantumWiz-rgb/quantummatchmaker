@@ -6,7 +6,7 @@
 # - Admin-only directory (emails in ADMIN_EMAILS)
 
 import os, re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
 import numpy as np
@@ -14,7 +14,6 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import OperationalError
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from passlib.hash import pbkdf2_sha256
@@ -210,7 +209,7 @@ def create_user(email: str, org: str, role: str, password: str) -> Optional[int]
         conn.execute(text("""
             INSERT INTO users (email, org_name, account_role, password_hash, created_at)
             VALUES (:e,:o,:r,:p,:ts)
-        """), {"e": email.lower(), "o": org, "r": role, "p": ph, "ts": datetime.utcnow().isoformat()})
+        """), {"e": email.lower(), "o": org, "r": role, "p": ph, "ts": datetime.now(timezone.utc).isoformat()})
         uid = conn.execute(text("SELECT id FROM users WHERE email=:e"), {"e": email.lower()}).fetchone()[0]
         return uid
 
@@ -243,7 +242,7 @@ def insert_company(row: dict, owner_id: Optional[int]):
             "contact": row.get("contact",""),
             "public_profile": 1 if row.get("public_profile", True) else 0,
             "owner_id": owner_id,
-            "ts": datetime.utcnow().isoformat()
+            "ts": datetime.now(timezone.utc).isoformat()
         })
 
 def insert_need(row: dict, owner_id: Optional[int]):
@@ -265,7 +264,7 @@ def insert_need(row: dict, owner_id: Optional[int]):
             "location": row.get("location",""),
             "share_with_suppliers": 1 if row.get("share_with_suppliers", False) else 0,
             "owner_id": owner_id,
-            "ts": datetime.utcnow().isoformat()
+            "ts": datetime.now(timezone.utc).isoformat()
         })
 
 def fetch_df(table: str, where: Optional[str] = None, params: Optional[dict] = None) -> pd.DataFrame:
@@ -291,53 +290,75 @@ def delete_row(table: str, row_id: int, owner_id: Optional[int] = None, admin: b
 # ---------- Matching ----------
 def add_docs_tags_companies(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
-    df["_doc"] = df.apply(lambda r: expand_with_ontology(f"{r['focus_areas']} . {r['capabilities_text']}"), axis=1)
-    df["_tech_tags"] = df.apply(lambda r: tuple(infer_tech_class(f"{r['focus_areas']} . {r['capabilities_text']}")), axis=1)
+    df = df.fillna("")
+    df["_doc"] = df.apply(lambda r: expand_with_ontology(f"{r.get('focus_areas','')} . {r.get('capabilities_text','')}"), axis=1)
+    df["_tech_tags"] = df.apply(lambda r: tuple(infer_tech_class(f"{r.get('focus_areas','')} . {r.get('capabilities_text','')}")), axis=1)
     return df
 
 def add_docs_tags_needs(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
-    df["_doc"] = df.apply(lambda r: expand_with_ontology(f"{r['need_text']} . {r['constraints']} . {r['environment']}"), axis=1)
-    df["_tech_tags"] = df.apply(lambda r: tuple(infer_tech_class(f"{r['need_text']}")), axis=1)
+    df = df.fillna("")
+    df["_doc"] = df.apply(lambda r: expand_with_ontology(f"{r.get('need_text','')} . {r.get('constraints','')} . {r.get('environment','')}"), axis=1)
+    df["_tech_tags"] = df.apply(lambda r: tuple(infer_tech_class(f"{r.get('need_text','')}")), axis=1)
     return df
+
+def _safe_sort(df: pd.DataFrame, by, ascending):
+    """Sort only by columns that actually exist."""
+    if df.empty:
+        return df
+    by = [c for c in by if c in df.columns]
+    if not by:
+        return df
+    if isinstance(ascending, list):
+        ascending = ascending[:len(by)]
+    return df.sort_values(by, ascending=ascending)
 
 def compute_need_to_sensor_scores(needs_df: pd.DataFrame, sensors_df: pd.DataFrame,
                                   alpha=0.6, beta=0.25, gamma=0.15) -> pd.DataFrame:
-    if needs_df.empty or sensors_df.empty:
-        return pd.DataFrame()
+    cols = [
+        "need_id","need_org","need_title","sensor_company","sensor_id","sensor_trl",
+        "sensor_focus","sensor_contact","cosine","domain_bonus","trl_score","penalty",
+        "total_score","need_tags","sensor_tags"
+    ]
+    if needs_df is None or needs_df.empty or sensors_df is None or sensors_df.empty:
+        return pd.DataFrame(columns=cols)
+
     need_docs = needs_df["_doc"].tolist()
     sensor_docs = sensors_df["_doc"].tolist()
-    vec = build_vectorizer(need_docs + sensor_docs)
-    N = vec.transform(need_docs)
-    S = vec.transform(sensor_docs)
-    cos = cosine_similarity(N, S)
+    try:
+        vec = build_vectorizer(need_docs + sensor_docs)
+        N = vec.transform(need_docs)
+        S = vec.transform(sensor_docs)
+        cos = cosine_similarity(N, S)
+    except Exception:
+        cos = np.zeros((len(need_docs), len(sensor_docs)))
+
     rows = []
     for i, nrow in needs_df.iterrows():
         for j, srow in sensors_df.iterrows():
             cos_score = float(cos[needs_df.index.get_loc(i), sensors_df.index.get_loc(j)])
-            need_tags = nrow["_tech_tags"]; sensor_tags = srow["_tech_tags"]
+            need_tags = nrow["_tech_tags"]
+            sensor_tags = srow["_tech_tags"]
             tech_overlap = len(set(need_tags).intersection(set(sensor_tags)))
-            domain_bonus = 0.05 * tech_overlap + environment_bonus(nrow["environment"], srow["capabilities_text"])
-            if "gps_denied" in nrow["_doc"] or "gps free" in normalize_text(nrow["need_text"]):
+            domain_bonus = 0.05 * tech_overlap + environment_bonus(nrow.get("environment",""), srow.get("capabilities_text",""))
+            if "gps_denied" in nrow["_doc"] or "gps free" in normalize_text(nrow.get("need_text","")):
                 if any(t in srow["_doc"] for t in ["magnet","imu","compass","magnetometer","magnetometry"]):
                     domain_bonus += 0.08
-            trl = srow["trl"] if pd.notna(srow["trl"]) else None
-            trl_score = trl_alignment_score(nrow["timeline"], trl)
-            pen = constraint_penalties(nrow["constraints"], srow["capabilities_text"])
+            trl = srow["trl"] if pd.notna(srow.get("trl")) else None
+            trl_score = trl_alignment_score(nrow.get("timeline",""), trl)
+            pen = constraint_penalties(nrow.get("constraints",""), srow.get("capabilities_text",""))
             total = alpha * cos_score + beta * domain_bonus + gamma * trl_score + pen
             rows.append({
                 "need_id": nrow["id"], "need_org": nrow["org_name"], "need_title": nrow["need_title"],
-                "sensor_company": srow["company_name"], "sensor_id": srow["id"], "sensor_trl": srow["trl"],
-                "sensor_focus": srow["focus_areas"], "sensor_contact": srow["contact"],
+                "sensor_company": srow["company_name"], "sensor_id": srow["id"], "sensor_trl": srow.get("trl"),
+                "sensor_focus": srow.get("focus_areas",""), "sensor_contact": srow.get("contact",""),
                 "cosine": round(cos_score, 4), "domain_bonus": round(domain_bonus, 4),
                 "trl_score": round(trl_score, 4), "penalty": round(pen, 4),
                 "total_score": round(total, 4),
                 "need_tags": ";".join(need_tags), "sensor_tags": ";".join(sensor_tags),
             })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df.sort_values(["need_org","need_title","total_score"], ascending=[True, True, False], inplace=True)
-    return df
+    df = pd.DataFrame(rows, columns=cols)
+    return _safe_sort(df, ["need_org","need_title","total_score"], [True, True, False])
 
 # ---------- UI ----------
 st.set_page_config(page_title="Quantum Matchmaker (Auth)", page_icon="🧭", layout="wide")
@@ -460,9 +481,17 @@ elif nav == "Find Matches":
             pick_id = int(pick.split("•")[0].strip()[1:])
             need_sel = needs_all[needs_all["id"] == pick_id]
             sensors = companies[companies["role"] == "sensor"]
-            matches = compute_need_to_sensor_scores(need_sel, sensors).sort_values("total_score", ascending=False).head(topk)
-            st.subheader("Best Sensor Matches")
-            st.dataframe(matches[["sensor_company","total_score","cosine","domain_bonus","trl_score","penalty","sensor_focus","sensor_trl","sensor_contact"]])
+            matches = compute_need_to_sensor_scores(need_sel, sensors)
+            if matches.empty:
+                st.info("No matching sensors yet. Add supplier profiles, or broaden your need description.")
+            else:
+                matches = matches.head(topk)
+                show_cols = [c for c in [
+                    "sensor_company","total_score","cosine","domain_bonus","trl_score","penalty",
+                    "sensor_focus","sensor_trl","sensor_contact"
+                ] if c in matches.columns]
+                st.subheader("Best Sensor Matches")
+                st.dataframe(matches[show_cols], use_container_width=True)
 
     elif mode == "Sensor Company":
         my_sensors = fetch_df("companies", where="owner_id=:oid AND role='sensor'", params={"oid": user["id"]})
@@ -475,9 +504,16 @@ elif nav == "Find Matches":
             s_sel = my_sensors[my_sensors["id"] == sid]
             public_needs = fetch_df("needs", where="share_with_suppliers=1", params={})
             public_needs = add_docs_tags_needs(public_needs)
-            matches = compute_need_to_sensor_scores(public_needs, s_sel).sort_values("total_score", ascending=False).head(topk)
-            st.subheader("Public Leads (end-users who opted to share)")
-            st.dataframe(matches[["need_org","need_title","total_score","cosine","domain_bonus","trl_score","penalty"]])
+            matches = compute_need_to_sensor_scores(public_needs, s_sel)
+            if matches.empty:
+                st.info("No public leads yet. End-users must opt-in by checking 'share with suppliers' on a need.")
+            else:
+                matches = matches.head(topk)
+                show_cols = [c for c in [
+                    "need_org","need_title","total_score","cosine","domain_bonus","trl_score","penalty"
+                ] if c in matches.columns]
+                st.subheader("Public Leads (end-users who opted to share)")
+                st.dataframe(matches[show_cols], use_container_width=True)
 
     else:  # Materials Supplier
         my_mats = fetch_df("companies", where="owner_id=:oid AND role='materials'", params={"oid": user["id"]})
