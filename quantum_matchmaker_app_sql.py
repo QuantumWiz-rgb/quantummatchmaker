@@ -350,7 +350,7 @@ def auth_bar():
         st.sidebar.write(f"Signed in as **{u['org']}** ({u['email']})")
         if st.sidebar.button("Sign out"):
             st.session_state.pop("user", None)
-            st.experimental_rerun()
+            st.rerun()
         st.sidebar.markdown("---")
     else:
         tab_login, tab_signup = st.sidebar.tabs(["Sign in", "Create account"])
@@ -361,7 +361,7 @@ def auth_bar():
                 user = verify_user(email, pw)
                 if user:
                     st.session_state["user"] = user
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error("Invalid email or password.")
         with tab_signup:
