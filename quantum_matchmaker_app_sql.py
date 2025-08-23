@@ -5,15 +5,15 @@
 # - Sensor sees END-USER leads (opt-in) + MATERIALS matches (scoped by selected Opportunity)
 # - Materials sees SENSOR matches only (no end-user visibility)
 #
-# NEW:
-# - OpenAI embeddings + lightweight LLM reranker (automatic fallback if no API key or package)
-# - Embeddings cached in DB (TEXT JSON) for companies & needs
-# - Hard domain filters (no cryo, TRL gates) and technique scoping for sensor→materials
+# Features:
+# - OpenAI embeddings + LLM reranker (fallback to TF-IDF if no key)
+# - Embeddings cached in DB
 # - Deep Reasoning toggle + LLM influence slider (visible effect)
-# - AI Diagnostics expander (verify real OpenAI traffic)
-# - Sidebar DEBUG switch: set DEBUG_AI=1 in secrets/env to surface API errors
+# - "Why (AI rationale)" expanders always rendered when LLM is enabled
+# - Robust JSON parsing with fallback; sidebar DEBUG shows errors
+# - AI Diagnostics expander (live embedding/chat smoke test)
 
-import os, re, json, math
+import os, re, json
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
@@ -44,8 +44,7 @@ OPENAI_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", Non
 EMBED_MODEL = os.getenv("EMBED_MODEL") or st.secrets.get("EMBED_MODEL", "text-embedding-3-small")
 RERANK_MODEL = os.getenv("RERANK_MODEL") or st.secrets.get("RERANK_MODEL", "gpt-4o-mini")
 DEBUG_AI = bool(int(os.getenv("DEBUG_AI") or st.secrets.get("DEBUG_AI", "0")))
-
-BUILD_STAMP = "2025-08-23-DR2"
+BUILD_STAMP = "2025-08-23-why-on"
 
 def has_openai() -> bool:
     return bool(OPENAI_KEY and OpenAI is not None)
@@ -184,49 +183,67 @@ def embed_text(text: str) -> Optional[List[float]]:
             st.sidebar.error(f"OpenAI embeddings error: {type(ex).__name__}: {ex}")
         return None
 
-def cosine_from_vectors(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    # A: nxd, B: mxd -> n x m cosine matrix
-    if A.size == 0 or B.size == 0:
-        return np.zeros((A.shape[0], B.shape[0]))
-    A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
-    B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
-    return A_norm @ B_norm.T
+def _parse_json_object_loose(s: str) -> Optional[dict]:
+    """Best-effort: find outermost JSON object in a string (handles stray text/code fences)."""
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        first = s.find("{"); last = s.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            return json.loads(s[first:last+1])
+    except Exception:
+        return None
+    return None
 
-def llm_rerank(query_context: str, candidates: List[Dict], top_only: int = 20) -> Dict[str, Dict]:
-    """Return {id: {'score': float (0..1), 'why': str}}. Fallback to empty dict on any error."""
+def llm_rerank(query_context: str, candidates: List[Dict], *, top_only: int = 20, min_why_len: int = 40) -> Dict[str, Dict]:
+    """
+    Return {id: {'score': float (0..1), 'why': str}}.
+    Robust JSON parsing + sidebar errors in DEBUG mode.
+    """
     client = get_openai_client()
     if not client or not candidates:
         return {}
+
     items = candidates[:top_only]
     try:
-        import json as _json
         sys_prompt = (
-            "You are a technical sourcing assistant for quantum sensing. "
-            "Score each candidate from 0 to 1 for how well it fits the query context. "
-            "Consider constraints (no-cryo, power), TRL/timeline fit, and technique relevance. "
-            "Return STRICT JSON as an object mapping candidate 'id' to {'score': float, 'why': str}. "
-            "Base your reasoning only on the provided data; do not invent external facts."
+            "You are a technical sourcing assistant for quantum sensing.\n"
+            "For each candidate, output a score (0..1) and a detailed WHY explanation.\n"
+            "Focus on application fit, environment, bandwidth, dynamic range, sensitivity, vector/scalar, power/size.\n"
+            "Explain using ONLY provided info. Do not invent external facts.\n"
+            "Return STRICT JSON object: { '<id>': { 'score': <float>, 'why': <markdown string> }, ... }"
         )
-        user_payload = {
-            "query": query_context[:4000],
-            "candidates": items
-        }
-        msg = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": _json.dumps(user_payload)}
-        ]
+        user_payload = {"query": query_context[:6000], "candidates": items}
         resp = client.chat.completions.create(
             model=RERANK_MODEL,
-            messages=msg,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": json.dumps(user_payload)}
+            ],
             temperature=0,
             response_format={"type": "json_object"},
+            max_tokens=900
         )
-        data = resp.choices[0].message.content
-        out = _json.loads(data)
+        raw = resp.choices[0].message.content
+        parsed = _parse_json_object_loose(raw)
+        if not isinstance(parsed, dict):
+            if DEBUG_AI:
+                st.sidebar.error("LLM rerank: JSON parse failed")
+            return {}
+
         cleaned = {}
-        for k, v in out.items():
+        for k, v in parsed.items():
             try:
-                cleaned[str(k)] = {"score": float(v.get("score", 0)), "why": str(v.get("why", ""))[:700]}
+                sc = float(v.get("score", 0.0))
+                why = str(v.get("why", "")).strip()
+                if len(why) < min_why_len:
+                    # Guard against trivial/empty explanations
+                    why = (why + "\n\n_(AI explanation was short; consider adding more detail to profiles/need.)_").strip()
+                cleaned[str(k)] = {"score": sc, "why": why[:4000]}
             except Exception:
                 continue
         return cleaned
@@ -234,6 +251,13 @@ def llm_rerank(query_context: str, candidates: List[Dict], top_only: int = 20) -
         if DEBUG_AI:
             st.sidebar.error(f"OpenAI rerank error: {type(ex).__name__}: {ex}")
         return {}
+
+def cosine_from_vectors(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    if A.size == 0 or B.size == 0:
+        return np.zeros((A.shape[0], B.shape[0]))
+    A_norm = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
+    B_norm = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
+    return A_norm @ B_norm.T
 
 # ---------- DB ----------
 def get_engine() -> Engine:
@@ -289,7 +313,6 @@ def init_db():
                 embed TEXT            -- JSON list[float]
             )
         """))
-        # NEW: opportunities table (per-application containers owned by sensors)
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS opportunities (
                 id INTEGER PRIMARY KEY {_auto_inc_kw()},
@@ -302,7 +325,6 @@ def init_db():
                 created_at TEXT
             )
         """))
-        # Migrations (add columns if missing)
         def ensure_col(table, name, sqldef):
             try:
                 conn.execute(text(f"SELECT {name} FROM {table} LIMIT 1"))
@@ -444,7 +466,7 @@ def delete_row(table: str, row_id: int, owner_id: Optional[int] = None, admin: b
             ).rowcount
     return res > 0
 
-# ---------- Matching ----------
+# ---------- Matching helpers ----------
 def add_docs_tags_companies(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: return df
     df = df.fillna("")
@@ -496,6 +518,7 @@ def _emb_cosine_block(left_df: pd.DataFrame, right_df: pd.DataFrame) -> Optional
     except Exception:
         return None
 
+# ---------- Scorers (LLM is called even if influence=0 to produce WHY) ----------
 def compute_need_to_sensor_scores(
     needs_df: pd.DataFrame,
     sensors_df: pd.DataFrame,
@@ -516,7 +539,6 @@ def compute_need_to_sensor_scores(
         if s_filtered.empty:
             continue
 
-        # Try embeddings cosine; fallback to TF-IDF
         cosM = _emb_cosine_block(needs_df.loc[[nrow.name]], s_filtered) if has_openai() else None
         if cosM is None:
             need_docs = [nrow["_doc"]]
@@ -555,7 +577,7 @@ def compute_need_to_sensor_scores(
 
         df = pd.DataFrame(rows, columns=cols)
 
-        # LLM rerank on top-N by base score
+        # LLM rerank/explanations on top-N
         if not df.empty and has_openai() and use_deep_reasoning:
             pre = df.sort_values("total_score", ascending=False).head(20)
             context = (
@@ -570,11 +592,18 @@ def compute_need_to_sensor_scores(
                       "text": f"{r.sensor_company}. Focus: {r.sensor_focus}. "
                               f"Caps: {s_filtered.loc[s_filtered['id']==r.sensor_id, 'capabilities_text'].values[0] if (s_filtered['id']==r.sensor_id).any() else ''}. "
                               f"TRL:{r.sensor_trl}"} for _, r in pre.iterrows()]
+
             boosts = llm_rerank(context, cands, top_only=20)
             if boosts:
+                # Always attach WHY; adjust ranking only if llm_w>0
                 df["llm_score"] = df["sensor_id"].astype(str).map(lambda x: boosts.get(x, {}).get("score", 0.0)).fillna(0.0)
                 df["why"] = df["sensor_id"].astype(str).map(lambda x: boosts.get(x, {}).get("why", "")).fillna("")
-                df["total_score"] = (1.0 - llm_w) * df["total_score"] + llm_w * df["llm_score"]
+                if llm_w > 0:
+                    df["total_score"] = (1.0 - llm_w) * df["total_score"] + llm_w * df["llm_score"]
+            else:
+                # Surface absence in UI later
+                df["why"] = ""
+
         results.append(df)
 
     out = pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=cols)
@@ -585,11 +614,9 @@ def filter_sensors_for_need(need_row: pd.Series, sensors_df: pd.DataFrame) -> pd
     s = sensors_df.copy()
     cons = normalize_text(need_row.get("constraints",""))
     months = _timeline_months(need_row.get("timeline",""))
-    # no-cryo => drop anything obviously cryogenic / SQUID
     if any(t in cons for t in ["no cryogenic","no cryogenics","no cryo"]):
         mask = ~s["_doc"].str.contains(r"(cryogen|squid|cryostat|helium|cryocooler|superconduct)", regex=True)
         s = s[mask]
-    # TRL gate for short timelines
     if months <= 12:
         s = s[(s["trl"].fillna(9).astype(int) >= 5)]
     return s
@@ -598,7 +625,6 @@ def filter_materials_for_sensor(sensor_row: pd.Series, materials_df: pd.DataFram
     if materials_df.empty: return materials_df
     m = materials_df.copy()
     tags = set(sensor_row.get("_tech_tags", []))
-    # simple technique scoping: if NV diamond sensor, prefer diamond/NV materials
     if "NV_diamond" in tags:
         m = m[m["_doc"].str.contains(r"(diamond|nv|nitrogen vacancy|cvd)", regex=True)]
     return m
@@ -610,7 +636,6 @@ def compute_sensor_to_material_scores(
     use_deep_reasoning: bool = True,
     alpha=0.6, beta=0.25, gamma=0.1, llm_w=0.15
 ) -> pd.DataFrame:
-    """Match ONE sensor profile to many materials; optionally use a need context for env/constraints bonuses."""
     cols = [
         "sensor_id","sensor_company","materials_company","materials_id",
         "cosine","domain_bonus","context_bonus","total_score",
@@ -624,7 +649,6 @@ def compute_sensor_to_material_scores(
     if materials_df.empty:
         return pd.DataFrame(columns=cols)
 
-    # embeddings cosine preferred
     cosV = None
     if has_openai():
         try:
@@ -672,8 +696,7 @@ def compute_sensor_to_material_scores(
 
     if not df.empty and has_openai() and use_deep_reasoning:
         pre = df.sort_values("total_score", ascending=False).head(20)
-        ctx = f"Sensor technique/context: {', '.join(sorted(s_tags))}. " \
-              f"Opportunity env/constraints: env={env}; constraints={constraints}."
+        ctx = f"Sensor technique/context: {', '.join(sorted(s_tags))}. Opportunity env/constraints: env={env}; constraints={constraints}."
         cands = [{"id": str(r.materials_id),
                   "text": f"{r.materials_company}. Focus: {r.materials_focus}. "
                           f"Caps: {materials_df.loc[materials_df['id']==r.materials_id,'capabilities_text'].values[0] if (materials_df['id']==r.materials_id).any() else ''}"} for _, r in pre.iterrows()]
@@ -681,7 +704,10 @@ def compute_sensor_to_material_scores(
         if boosts:
             df["llm_score"] = df["materials_id"].astype(str).map(lambda x: boosts.get(x, {}).get("score", 0.0)).fillna(0.0)
             df["why"] = df["materials_id"].astype(str).map(lambda x: boosts.get(x, {}).get("why", "")).fillna("")
-            df["total_score"] = (1.0 - llm_w) * df["total_score"] + llm_w * df["llm_score"]
+            if llm_w > 0:
+                df["total_score"] = (1.0 - llm_w) * df["total_score"] + llm_w * df["llm_score"]
+        else:
+            df["why"] = ""
     return _safe_sort(df, ["total_score"], [False])
 
 def compute_material_to_sensor_scores(
@@ -690,7 +716,6 @@ def compute_material_to_sensor_scores(
     use_deep_reasoning: bool = True,
     alpha=0.6, beta=0.25, gamma=0.0, llm_w=0.15
 ) -> pd.DataFrame:
-    """Mirror of sensor->materials for the materials user (no end-user context)."""
     cols = [
         "materials_id","materials_company","sensor_company","sensor_id",
         "cosine","domain_bonus","total_score","materials_tags","sensor_tags",
@@ -749,7 +774,10 @@ def compute_material_to_sensor_scores(
         if boosts:
             df["llm_score"] = df["sensor_id"].astype(str).map(lambda x: boosts.get(x, {}).get("score", 0.0)).fillna(0.0)
             df["why"] = df["sensor_id"].astype(str).map(lambda x: boosts.get(x, {}).get("why", "")).fillna("")
-            df["total_score"] = (1.0 - llm_w) * df["total_score"] + llm_w * df["llm_score"]
+            if llm_w > 0:
+                df["total_score"] = (1.0 - llm_w) * df["total_score"] + llm_w * df["llm_score"]
+        else:
+            df["why"] = ""
     return _safe_sort(df, ["total_score"], [False])
 
 # ---------- UI ----------
@@ -761,11 +789,7 @@ def auth_bar():
     if st.session_state.get("user"):
         u = st.session_state["user"]
         st.sidebar.write(f"Signed in as **{u['org']}** ({u['email']})")
-        # status of AI features
-        if has_openai():
-            st.sidebar.caption("AI matching: **ON** (embeddings + rerank)")
-        else:
-            st.sidebar.caption("AI matching: OFF (TF-IDF fallback)")
+        st.sidebar.caption("AI matching: **ON** (embeddings + rerank)" if has_openai() else "AI matching: OFF (TF-IDF fallback)")
         if st.sidebar.button("Sign out"):
             st.session_state.pop("user", None)
             st.rerun()
@@ -889,20 +913,17 @@ elif nav == "Find Matches":
     user = st.session_state["user"]
     st.header("Find Matches")
 
-    # Controls that visibly change behavior/results
-    deep_reason = st.toggle("Use Deep Reasoning (LLM)", value=True, help="If off, ranks use only embeddings/TF-IDF + rules.")
-    llm_w_ui = st.slider("LLM influence on ranking", 0.0, 0.60, 0.15, 0.01, help="Higher = LLM score shifts ranks more")
+    deep_reason = st.toggle("Use Deep Reasoning (LLM)", value=True, help="If off, ranks use only embeddings/TF-IDF + rules. When on, AI explanations are generated and shown.")
+    llm_w_ui = st.slider("LLM influence on ranking", 0.0, 0.60, 0.15, 0.01, help="Higher = LLM score shifts ranks more (explanations are shown regardless).")
     topk = st.slider("Top-K results", 1, 20, 7)
     mode = st.selectbox("I am looking for matches for my…", ["End-User Need", "Sensor Company", "Materials Supplier"])
 
-    # Shared prep
     companies_public = fetch_df("companies", where="public_profile=1", params={})
     needs_owned = fetch_df("needs", where="owner_id=:oid", params={"oid": user["id"]})
 
     companies_public = add_docs_tags_companies(companies_public)
     needs_owned = add_docs_tags_needs(needs_owned)
 
-    # Compute any missing embeddings & persist (no-op if no API key)
     companies_public = _ensure_embeddings("companies", companies_public)
     needs_owned = _ensure_embeddings("needs", needs_owned)
 
@@ -915,17 +936,33 @@ elif nav == "Find Matches":
             pick_id = int(pick.split("•")[0].strip()[1:])
             need_sel = needs_owned[needs_owned["id"] == pick_id]
             sensors = companies_public[companies_public["role"] == "sensor"]
-            s2 = _ensure_embeddings("companies", sensors)  # ensure embeds for slice
+            s2 = _ensure_embeddings("companies", sensors)
             matches = compute_need_to_sensor_scores(need_sel, s2, use_deep_reasoning=deep_reason, llm_w=llm_w_ui)
             if matches.empty:
                 st.info("No matching sensors yet. Add supplier profiles, or broaden your need description.")
             else:
                 st.subheader("Best Sensor Matches")
-                show_cols = [c for c in [
+                table_cols = [c for c in [
                     "sensor_company","total_score","cosine","domain_bonus","trl_score","penalty",
-                    "sensor_focus","sensor_trl","sensor_contact","why"
+                    "sensor_focus","sensor_trl","sensor_contact"
                 ] if c in matches.columns]
-                st.dataframe(matches.head(topk)[show_cols], use_container_width=True)
+                st.dataframe(matches.head(topk)[table_cols], use_container_width=True)
+
+                # WHY (AI) expanders
+                if deep_reason and has_openai():
+                    st.markdown("### Why (AI rationale)")
+                    any_why = False
+                    for _, r in matches.head(topk).iterrows():
+                        label = f"{r['sensor_company']} • score {r['total_score']}"
+                        text = (r.get("why","") or "").strip()
+                        with st.expander(label):
+                            if text:
+                                st.markdown(text)
+                                any_why = True
+                            else:
+                                st.info("No AI rationale was returned. Check AI diagnostics in the sidebar.")
+                    if not any_why:
+                        st.warning("AI ran but returned no explanations for these rows. Toggle DEBUG_AI to inspect.")
 
     # ---- Sensor: see end-user leads + materials (scoped by chosen Opportunity)
     elif mode == "Sensor Company":
@@ -951,12 +988,26 @@ elif nav == "Find Matches":
                     st.info("No public end-user leads yet. End-users must opt-in by checking 'share with suppliers'.")
                 else:
                     st.subheader("Matching End-User Leads")
-                    show_cols = [c for c in [
-                        "need_org","need_title","total_score","cosine","domain_bonus","trl_score","penalty","why"
+                    table_cols = [c for c in [
+                        "need_org","need_title","total_score","cosine","domain_bonus","trl_score","penalty"
                     ] if c in lead_matches.columns]
-                    st.dataframe(lead_matches.head(topk)[show_cols], use_container_width=True)
+                    st.dataframe(lead_matches.head(topk)[table_cols], use_container_width=True)
 
-                    # Create an Opportunity from a selected lead
+                    if deep_reason and has_openai():
+                        st.markdown("### Why (AI rationale for sensor audience)")
+                        any_why = False
+                        for _, r in lead_matches.head(topk).iterrows():
+                            label = f"Lead #{r['need_id']} — {r['need_title']} • score {r['total_score']}"
+                            text = (r.get("why","") or "").strip()
+                            with st.expander(label):
+                                if text:
+                                    st.markdown(text)
+                                    any_why = True
+                                else:
+                                    st.info("No AI rationale was returned. Check AI diagnostics in the sidebar.")
+                        if not any_why:
+                            st.warning("AI ran but returned no explanations for these rows. Toggle DEBUG_AI to inspect.")
+
                     pick_lead = st.selectbox(
                         "Create an Opportunity for this lead",
                         [f"#{r.need_id} • {r.need_org} — {r.need_title}" for _, r in lead_matches.iterrows()]
@@ -995,11 +1046,26 @@ elif nav == "Find Matches":
                     st.info("No matching materials yet. Encourage materials suppliers to add public profiles, or broaden your technique/capability text.")
                 else:
                     st.subheader("Best Materials Matches")
-                    show_cols = [c for c in [
+                    table_cols = [c for c in [
                         "materials_company","total_score","cosine","domain_bonus","context_bonus",
-                        "materials_focus","materials_contact","materials_tags","why"
+                        "materials_focus","materials_contact","materials_tags"
                     ] if c in s2m.columns]
-                    st.dataframe(s2m.head(topk)[show_cols], use_container_width=True)
+                    st.dataframe(s2m.head(topk)[table_cols], use_container_width=True)
+
+                    if deep_reason and has_openai():
+                        st.markdown("### Why (AI rationale for sensor audience)")
+                        any_why = False
+                        for _, r in s2m.head(topk).iterrows():
+                            label = f"{r['materials_company']} • score {r['total_score']}"
+                            text = (r.get("why","") or "").strip()
+                            with st.expander(label):
+                                if text:
+                                    st.markdown(text)
+                                    any_why = True
+                                else:
+                                    st.info("No AI rationale was returned. Check AI diagnostics in the sidebar.")
+                        if not any_why:
+                            st.warning("AI ran but returned no explanations for these rows. Toggle DEBUG_AI to inspect.")
 
     # ---- Materials: see sensors only (no end-user visibility)
     else:
@@ -1020,10 +1086,25 @@ elif nav == "Find Matches":
                 st.info("No matching sensors yet. Encourage sensors to publish profiles, or broaden your capability text.")
             else:
                 st.subheader("Best Sensor Matches")
-                show_cols = [c for c in [
-                    "sensor_company","total_score","cosine","domain_bonus","sensor_focus","sensor_contact","sensor_tags","why"
+                table_cols = [c for c in [
+                    "sensor_company","total_score","cosine","domain_bonus","sensor_focus","sensor_contact","sensor_tags"
                 ] if c in m2s.columns]
-                st.dataframe(m2s.head(topk)[show_cols], use_container_width=True)
+                st.dataframe(m2s.head(topk)[table_cols], use_container_width=True)
+
+                if deep_reason and has_openai():
+                    st.markdown("### Why (AI rationale for materials audience)")
+                    any_why = False
+                    for _, r in m2s.head(topk).iterrows():
+                        label = f"{r['sensor_company']} • score {r['total_score']}"
+                        text = (r.get("why","") or "").strip()
+                        with st.expander(label):
+                            if text:
+                                st.markdown(text)
+                                any_why = True
+                            else:
+                                st.info("No AI rationale was returned. Check AI diagnostics in the sidebar.")
+                    if not any_why:
+                        st.warning("AI ran but returned no explanations for these rows. Toggle DEBUG_AI to inspect.")
 
 # ----- Directory & Admin -----
 elif nav == "Directory & Admin":
@@ -1068,11 +1149,8 @@ elif nav == "Directory & Admin":
 else:
     st.header("About")
     st.write("""
-This build implements **chain of command** with **per-application Opportunities** and hybrid matching:
-- Embeddings + LLM rerank (if `OPENAI_API_KEY` present); TF-IDF fallback otherwise.
-- Deep Reasoning toggle with adjustable influence so you can see the LLM impact on ranks.
-- AI diagnostics to verify your key and confirm live calls to OpenAI.
-- Hard filters (no-cryo, TRL gates) prevent obviously wrong matches.
-- Sensors match to **end-user leads** (opt-in) and **materials** (scoped by chosen Opportunity).
-- End-users match to **sensors** only; materials match to **sensors** only.
+This build makes LLM rationale unmissable:
+- Explanations show in expanders under every results table when Deep Reasoning is ON.
+- LLM is called for the WHY even if its score influence slider is set to 0.
+- Robust JSON parsing + DEBUG sidebar so you can see errors if the model replies oddly.
 """)
