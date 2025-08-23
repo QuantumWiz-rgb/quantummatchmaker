@@ -193,16 +193,16 @@ def init_db():
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS opportunities (
                 id INTEGER PRIMARY KEY {_auto_inc_kw()},
-                owner_id INTEGER,              -- user id (sensor's account)
-                sensor_company_id INTEGER,     -- companies.id (role='sensor')
-                need_id INTEGER NULL,          -- needs.id (nullable)
+                owner_id INTEGER,
+                sensor_company_id INTEGER,
+                need_id INTEGER NULL,
                 title TEXT,
-                technique TEXT,                -- free text for now (e.g., NV-ODMR, NV-LTM, SERF OPM)
-                status TEXT,                   -- open/closed
+                technique TEXT,
+                status TEXT,
                 created_at TEXT
             )
         """))
-        # Migrate existing DBs (add columns if missing)
+        # Migrations (add columns if missing)
         def ensure_col(table, name, sqldef):
             try:
                 conn.execute(text(f"SELECT {name} FROM {table} LIMIT 1"))
@@ -212,7 +212,6 @@ def init_db():
         ensure_col("companies", "owner_id", "owner_id INTEGER")
         ensure_col("needs", "share_with_suppliers", "share_with_suppliers TINYINT")
         ensure_col("needs", "owner_id", "owner_id INTEGER")
-        # ensure cols for opportunities if schema pre-existed without some columns
         try:
             conn.execute(text("SELECT owner_id, sensor_company_id, need_id, technique, status FROM opportunities LIMIT 1"))
         except Exception:
@@ -405,7 +404,7 @@ def compute_need_to_sensor_scores(needs_df: pd.DataFrame, sensors_df: pd.DataFra
 def compute_sensor_to_material_scores(sensor_df: pd.DataFrame, materials_df: pd.DataFrame,
                                       need_context: Optional[pd.Series] = None,
                                       alpha=0.65, beta=0.25, gamma=0.10) -> pd.DataFrame:
-    """Match ONE sensor profile (rows=1) to many materials; optionally use a need context for env/constraints bonuses."""
+    """Match ONE sensor profile to many materials; optionally use a need context for env/constraints bonuses."""
     cols = [
         "sensor_id","sensor_company","materials_company","materials_id",
         "cosine","domain_bonus","context_bonus","total_score",
@@ -413,13 +412,18 @@ def compute_sensor_to_material_scores(sensor_df: pd.DataFrame, materials_df: pd.
     ]
     if sensor_df is None or sensor_df.empty or materials_df is None or materials_df.empty:
         return pd.DataFrame(columns=cols)
+
+    # Ensure positional indices align with cosine vector
+    sensor_df = sensor_df.iloc[[0]].reset_index(drop=True)
+    materials_df = materials_df.reset_index(drop=True)
+
     sdocs = sensor_df["_doc"].tolist()
     mdocs = materials_df["_doc"].tolist()
     try:
         vec = build_vectorizer(sdocs + mdocs)
         S = vec.transform(sdocs)
         M = vec.transform(mdocs)
-        cos = cosine_similarity(S, M)[0]  # single sensor row expected
+        cos = cosine_similarity(S, M)[0]  # shape (m,)
     except Exception:
         cos = np.zeros(len(mdocs))
 
@@ -429,20 +433,18 @@ def compute_sensor_to_material_scores(sensor_df: pd.DataFrame, materials_df: pd.
     s_tags = set(sensor_row["_tech_tags"])
 
     rows = []
-    for j, mrow in materials_df.iterrows():
+    for pos, mrow in materials_df.iterrows():  # pos = 0..m-1 after reset_index
         m_tags = set(mrow["_tech_tags"])
-        tech_overlap = len(s_tags.intersection(m_tags))
-        dom_bonus = 0.06 * tech_overlap
+        dom_bonus = 0.06 * len(s_tags.intersection(m_tags))
         ctx_bonus = 0.0
         if need_context is not None:
             ctx_bonus += environment_bonus(env, mrow.get("capabilities_text",""))
-            # light penalty propagation on materials if constraints overtly conflict
-            ctx_bonus += constraint_penalties(constraints, mrow.get("capabilities_text",""))  # negative values reduce
-        total = alpha * float(cos[j]) + beta * dom_bonus + gamma * ctx_bonus
+            ctx_bonus += constraint_penalties(constraints, mrow.get("capabilities_text",""))
+        total = alpha * float(cos[pos]) + beta * dom_bonus + gamma * ctx_bonus
         rows.append({
             "sensor_id": sensor_row["id"], "sensor_company": sensor_row["company_name"],
             "materials_company": mrow["company_name"], "materials_id": mrow["id"],
-            "cosine": round(float(cos[j]), 4), "domain_bonus": round(dom_bonus, 4),
+            "cosine": round(float(cos[pos]), 4), "domain_bonus": round(dom_bonus, 4),
             "context_bonus": round(ctx_bonus, 4), "total_score": round(total, 4),
             "sensor_tags": ";".join(sorted(s_tags)), "materials_tags": ";".join(sorted(m_tags)),
             "materials_focus": mrow.get("focus_areas",""), "materials_contact": mrow.get("contact",""),
@@ -460,26 +462,31 @@ def compute_material_to_sensor_scores(material_df: pd.DataFrame, sensors_df: pd.
     ]
     if material_df is None or material_df.empty or sensors_df is None or sensors_df.empty:
         return pd.DataFrame(columns=cols)
+
+    # Ensure positional indices align with cosine vector
+    material_df = material_df.iloc[[0]].reset_index(drop=True)
+    sensors_df = sensors_df.reset_index(drop=True)
+
     mdocs = material_df["_doc"].tolist()
     sdocs = sensors_df["_doc"].tolist()
     try:
         vec = build_vectorizer(mdocs + sdocs)
         M = vec.transform(mdocs)
         S = vec.transform(sdocs)
-        cos = cosine_similarity(M, S)[0]
+        cos = cosine_similarity(M, S)[0]  # shape (n_sensors,)
     except Exception:
         cos = np.zeros(len(sdocs))
 
     m_tags = set(material_df.iloc[0]["_tech_tags"])
     rows = []
-    for j, srow in sensors_df.iterrows():
+    for pos, srow in sensors_df.iterrows():  # pos = 0..n-1 after reset_index
         s_tags = set(srow["_tech_tags"])
         dom_bonus = 0.06 * len(m_tags.intersection(s_tags))
-        total = alpha * float(cos[j]) + beta * dom_bonus + gamma * 0.0
+        total = alpha * float(cos[pos]) + beta * dom_bonus + gamma * 0.0
         rows.append({
             "materials_id": material_df.iloc[0]["id"], "materials_company": material_df.iloc[0]["company_name"],
             "sensor_company": srow["company_name"], "sensor_id": srow["id"],
-            "cosine": round(float(cos[j]), 4), "domain_bonus": round(dom_bonus, 4),
+            "cosine": round(float(cos[pos]), 4), "domain_bonus": round(dom_bonus, 4),
             "total_score": round(total, 4),
             "materials_tags": ";".join(sorted(m_tags)), "sensor_tags": ";".join(sorted(s_tags)),
             "sensor_focus": srow.get("focus_areas",""), "sensor_contact": srow.get("contact",""),
