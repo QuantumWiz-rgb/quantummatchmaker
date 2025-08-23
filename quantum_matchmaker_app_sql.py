@@ -340,6 +340,15 @@ def _company_doc(row: dict) -> str:
 def _need_doc(row: dict) -> str:
     return expand_with_ontology(f"{row.get('need_text','')} . {row.get('constraints','')} . {row.get('environment','')}")
 
+# ---- fix for NaN embed cells ----
+def _is_missing_embed(val) -> bool:
+    """True if the embed cell is empty/NULL/NaN."""
+    return (
+        val is None
+        or (isinstance(val, float) and math.isnan(val))
+        or (isinstance(val, str) and val.strip() == "")
+    )
+
 def insert_company(row: dict, owner_id: Optional[int]):
     eng = get_engine()
     with eng.begin() as conn:
@@ -468,13 +477,15 @@ def _ensure_embeddings(table: str, df: pd.DataFrame):
     eng = get_engine()
     with eng.begin() as conn:
         for idx, r in df.iterrows():
-            if not r.get("embed"):
+            val = r.get("embed", None)
+            if _is_missing_embed(val):
                 text_doc = r.get("_doc","")
                 vec = embed_text(text_doc)
                 if vec:
-                    df.at[idx, "embed"] = json.dumps(vec)
+                    j = json.dumps(vec)
+                    df.at[idx, "embed"] = j
                     conn.execute(text(f"UPDATE {table} SET embed=:e WHERE id=:id"),
-                                 {"e": json.dumps(vec), "id": int(r["id"])})
+                                 {"e": j, "id": int(r["id"])})
     return df
 
 # ---- Domain filters (hard gates) ----
