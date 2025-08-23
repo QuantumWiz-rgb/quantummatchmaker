@@ -1,0 +1,7 @@
+streamlit
+SQLAlchemy
+pymysql
+psycopg2-binary
+pandas
+numpy
+scikit-learn
