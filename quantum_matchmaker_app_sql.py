@@ -1083,4 +1083,4 @@ elif nav == "Find Matches":
                     opp_id = int(pick_opp.split("•")[0].strip()[1:])
                     opp_row = my_opps[my_opps["id"] == opp_id].iloc[0]
                     if pd.notna(opp_row.get("need_id")) and int(opp_row["need_id"]) > 0:
-                        need_ctx_df = fetch_df("needs", where="id=:nid", params={"nid":
+                        need_ctx_df = fetch_df("needs", where="id=:nid", params={"nid":}
