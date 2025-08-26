@@ -1051,7 +1051,7 @@ elif nav == "Directory & Admin":
         if st.button("Delete Need"):
             ok = delete_row("needs", int(del_id), owner_id=user["id"], admin=True)
             st.success("Deleted." if ok else "Not found.")
-
+#r
     with tabs[2]:
         df = fetch_df("opportunities")
         st.dataframe(df)
